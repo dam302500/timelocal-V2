@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-TimeLocal API - Version optimisée pour Railway
-Version simplifiée et stable pour déploiement cloud
+TimeLocal API Enhanced - Version complète avec demandes, messagerie et réservations
 """
 
 import os
@@ -20,9 +19,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
     DATABASE_PATH = 'timelocal.db'
-    CORS_ORIGINS = ['*']  # Permissif pour les tests, restrictif en production
+    CORS_ORIGINS = ['*']  # Permissif pour les tests
     
-    # Variables d'environnement optionnelles
     APP_URL = os.environ.get('APP_URL', 'http://localhost:5000')
     DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
 
@@ -39,7 +37,7 @@ CORS(app,
 
 # Utilitaires base de données
 def init_db():
-    """Initialise la base de données avec les tables essentielles"""
+    """Initialise la base de données avec toutes les tables"""
     with sqlite3.connect(app.config['DATABASE_PATH']) as conn:
         conn.executescript('''
             -- Table des utilisateurs
@@ -51,75 +49,91 @@ def init_db():
                 full_name TEXT,
                 phone TEXT,
                 address TEXT,
+                postal_code TEXT,
                 bio TEXT,
                 skills TEXT,
                 time_credits INTEGER DEFAULT 100,
-                level TEXT DEFAULT 'new_user',
                 points INTEGER DEFAULT 0,
+                level TEXT DEFAULT 'new_user',
                 rating REAL DEFAULT 5.0,
-                rating_count INTEGER DEFAULT 0,
-                is_verified BOOLEAN DEFAULT FALSE,
-                is_active BOOLEAN DEFAULT TRUE,
-                last_login TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-            
+
             -- Table des demandes/offres
             CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('request', 'offer')),
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
                 category TEXT NOT NULL,
-                type TEXT NOT NULL, -- 'request' ou 'offer'
-                time_required INTEGER, -- en minutes
-                price REAL DEFAULT 0,
-                exchange_type TEXT DEFAULT 'time', -- 'time', 'money', 'hybrid'
+                duration TEXT,
                 location TEXT,
-                deadline TIMESTAMP,
-                status TEXT DEFAULT 'active', -- 'active', 'completed', 'cancelled'
+                postal_code TEXT,
+                credits INTEGER DEFAULT 0,
+                availability TEXT,
+                status TEXT DEFAULT 'active' CHECK (status IN ('active', 'reserved', 'completed', 'cancelled')),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             );
-            
-            -- Table des échanges
-            CREATE TABLE IF NOT EXISTS exchanges (
+
+            -- Table des réservations
+            CREATE TABLE IF NOT EXISTS reservations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id INTEGER NOT NULL,
                 requester_id INTEGER NOT NULL,
                 provider_id INTEGER NOT NULL,
-                status TEXT DEFAULT 'pending', -- 'pending', 'accepted', 'completed', 'cancelled'
-                start_time TIMESTAMP,
-                end_time TIMESTAMP,
-                time_spent INTEGER, -- en minutes
-                amount_paid REAL DEFAULT 0,
-                rating_requester INTEGER,
-                rating_provider INTEGER,
-                comment_requester TEXT,
-                comment_provider TEXT,
+                status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'declined', 'completed', 'cancelled')),
+                message TEXT,
+                scheduled_date TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (request_id) REFERENCES requests (id),
                 FOREIGN KEY (requester_id) REFERENCES users (id),
                 FOREIGN KEY (provider_id) REFERENCES users (id)
             );
-            
-            -- Index pour les performances
+
+            -- Table des messages
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                request_id INTEGER,
+                reservation_id INTEGER,
+                content TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (sender_id) REFERENCES users (id),
+                FOREIGN KEY (receiver_id) REFERENCES users (id),
+                FOREIGN KEY (request_id) REFERENCES requests (id),
+                FOREIGN KEY (reservation_id) REFERENCES reservations (id)
+            );
+
+            -- Index pour améliorer les performances
+            CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
+            CREATE INDEX IF NOT EXISTS idx_requests_postal_code ON requests(postal_code);
             CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
-            CREATE INDEX IF NOT EXISTS idx_exchanges_status ON exchanges(status);
-            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);
+            CREATE INDEX IF NOT EXISTS idx_reservations_requester ON reservations(requester_id);
+            CREATE INDEX IF NOT EXISTS idx_reservations_provider ON reservations(provider_id);
         ''')
 
 def get_db():
     """Obtient une connexion à la base de données"""
-    conn = sqlite3.connect(app.config['DATABASE_PATH'])
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(app.config['DATABASE_PATH'])
 
-def login_required(f):
-    """Décorateur pour vérifier la connexion utilisateur"""
+def dict_factory(cursor, row):
+    """Convertit les résultats SQL en dictionnaires"""
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+# Décorateurs
+def require_auth(f):
+    """Décorateur pour vérifier l'authentification"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
@@ -127,409 +141,481 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Routes principales
-@app.route('/')
-def index():
-    """Page d'accueil de l'API"""
-    return jsonify({
-        'app': 'TimeLocal API',
-        'version': '2.0.0',
-        'status': 'running',
-        'message': 'API TimeLocal déployée avec succès!',
-        'deployment': 'Railway/Render',
-        'endpoints': {
-            'health': '/health',
-            'auth': {
-                'register': 'POST /auth/register',
-                'login': 'POST /auth/login',
-                'logout': 'POST /auth/logout'
-            },
-            'users': {
-                'profile': 'GET /users/profile',
-                'update': 'PUT /users/profile'
-            },
-            'requests': {
-                'list': 'GET /requests',
-                'create': 'POST /requests'
-            }
-        }
-    })
-
-@app.route('/health')
-def health():
-    """Endpoint de santé pour Railway/Render"""
-    try:
-        # Test de connexion à la base de données
-        with get_db() as conn:
-            conn.execute('SELECT 1').fetchone()
-        
-        return jsonify({
-            'status': 'healthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'database': 'connected',
-            'deployment': 'success',
-            'version': '2.0.0'
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': datetime.utcnow().isoformat()
-        }), 500
-
 # Routes d'authentification
-@app.route('/auth/register', methods=['POST'])
-def register():
-    """Inscription d'un nouvel utilisateur"""
-    try:
-        # Gestion des données JSON et form-data
-        data = request.get_json() if request.is_json else request.form.to_dict()
-        
-        # Validation des données
-        required_fields = ['username', 'email', 'password']
-        missing_fields = [field for field in required_fields if not data.get(field)]
-        
-        if missing_fields:
-            return jsonify({
-                'error': f'Champs manquants: {", ".join(missing_fields)}'
-            }), 400
-        
-        # Validation email basique
-        if '@' not in data['email']:
-            return jsonify({'error': 'Email invalide'}), 400
-        
-        # Validation mot de passe
-        if len(data['password']) < 6:
-            return jsonify({'error': 'Mot de passe trop court (min 6 caractères)'}), 400
-        
-        with get_db() as conn:
-            # Vérifier si l'utilisateur existe déjà
-            existing = conn.execute(
-                'SELECT id FROM users WHERE username = ? OR email = ?',
-                (data['username'], data['email'])
-            ).fetchone()
-            
-            if existing:
-                return jsonify({'error': 'Nom d\'utilisateur ou email déjà utilisé'}), 409
-            
-            # Créer l'utilisateur
-            password_hash = generate_password_hash(data['password'])
-            cursor = conn.execute('''
-                INSERT INTO users (username, email, password_hash, full_name, phone, bio, skills)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                data['username'],
-                data['email'],
-                password_hash,
-                data.get('full_name', data['username']),
-                data.get('phone', ''),
-                data.get('bio', ''),
-                data.get('skills', '')
-            ))
-            
-            user_id = cursor.lastrowid
-            
-            # Créer une session
-            session['user_id'] = user_id
-            session['username'] = data['username']
-            session.permanent = True
-            
-            return jsonify({
-                'message': 'Utilisateur créé avec succès',
-                'user_id': user_id,
-                'username': data['username'],
-                'success': True
-            }), 201
-            
-    except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
-
 @app.route('/auth/login', methods=['POST'])
 def login():
-    """Connexion utilisateur"""
     try:
-        data = request.get_json() if request.is_json else request.form.to_dict()
+        data = request.get_json()
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '')
         
-        if not data.get('email') or not data.get('password'):
+        if not email or not password:
             return jsonify({'error': 'Email et mot de passe requis'}), 400
         
         with get_db() as conn:
-            user = conn.execute(
-                'SELECT * FROM users WHERE email = ? AND is_active = TRUE',
-                (data['email'],)
-            ).fetchone()
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
             
-            if not user or not check_password_hash(user['password_hash'], data['password']):
+            cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
+            user = cursor.fetchone()
+            
+            if user and check_password_hash(user['password_hash'], password):
+                session['user_id'] = user['id']
+                
+                # Supprimer les informations sensibles
+                user_data = {k: v for k, v in user.items() if k != 'password_hash'}
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Connexion réussie',
+                    'user': user_data
+                })
+            else:
                 return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
-            
-            # Mise à jour de la dernière connexion
-            conn.execute(
-                'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
-                (user['id'],)
-            )
-            
-            # Créer une session
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session.permanent = True
-            
-            return jsonify({
-                'message': 'Connexion réussie',
-                'success': True,
-                'user': {
-                    'id': user['id'],
-                    'username': user['username'],
-                    'full_name': user['full_name'],
-                    'email': user['email'],
-                    'time_credits': user['time_credits'],
-                    'points': user['points'],
-                    'level': user['level'],
-                    'rating': user['rating']
-                }
-            })
-            
+                
     except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+@app.route('/auth/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json()
+        username = data.get('username', '').strip()
+        email = data.get('email', '').strip().lower()
+        full_name = data.get('full_name', '').strip()
+        password = data.get('password', '')
+        
+        if not all([username, email, full_name, password]):
+            return jsonify({'error': 'Tous les champs sont requis'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'error': 'Le mot de passe doit contenir au moins 6 caractères'}), 400
+        
+        password_hash = generate_password_hash(password)
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                    INSERT INTO users (username, email, full_name, password_hash)
+                    VALUES (?, ?, ?, ?)
+                ''', (username, email, full_name, password_hash))
+                
+                user_id = cursor.lastrowid
+                conn.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Utilisateur créé avec succès',
+                    'user_id': user_id,
+                    'username': username
+                }), 201
+                
+            except sqlite3.IntegrityError:
+                return jsonify({'error': 'Nom d\'utilisateur ou email déjà utilisé'}), 409
+                
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
 
 @app.route('/auth/logout', methods=['POST'])
-@login_required
 def logout():
-    """Déconnexion utilisateur"""
     session.clear()
-    return jsonify({
-        'message': 'Déconnexion réussie',
-        'success': True
-    })
+    return jsonify({'success': True, 'message': 'Déconnexion réussie'})
 
-# Routes utilisateurs
+# Routes des utilisateurs
 @app.route('/users/profile', methods=['GET'])
-@login_required
+@require_auth
 def get_profile():
-    """Obtenir le profil de l'utilisateur connecté"""
     try:
         with get_db() as conn:
-            user = conn.execute(
-                'SELECT * FROM users WHERE id = ?',
-                (session['user_id'],)
-            ).fetchone()
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
             
-            if not user:
+            cursor.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
+            user = cursor.fetchone()
+            
+            if user:
+                user_data = {k: v for k, v in user.items() if k != 'password_hash'}
+                return jsonify({'user': user_data})
+            else:
                 return jsonify({'error': 'Utilisateur non trouvé'}), 404
-            
-            # Convertir en dictionnaire en excluant le mot de passe
-            user_dict = dict(user)
-            user_dict.pop('password_hash', None)
-            
-            return jsonify({
-                'user': user_dict,
-                'success': True
-            })
-            
+                
     except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
 
 @app.route('/users/profile', methods=['PUT'])
-@login_required
+@require_auth
 def update_profile():
-    """Mettre à jour le profil utilisateur"""
     try:
-        data = request.get_json() if request.is_json else request.form.to_dict()
+        data = request.get_json()
         
-        # Champs modifiables
-        updatable_fields = ['full_name', 'phone', 'address', 'bio', 'skills']
-        updates = []
-        values = []
+        # Champs autorisés à la mise à jour
+        allowed_fields = ['full_name', 'phone', 'address', 'postal_code', 'bio', 'skills']
+        update_data = {k: v for k, v in data.items() if k in allowed_fields}
         
-        for field in updatable_fields:
-            if field in data:
-                updates.append(f'{field} = ?')
-                values.append(data[field])
-        
-        if not updates:
+        if not update_data:
             return jsonify({'error': 'Aucune donnée à mettre à jour'}), 400
         
+        # Construire la requête SQL dynamiquement
+        set_clause = ', '.join([f'{k} = ?' for k in update_data.keys()])
+        values = list(update_data.values()) + [session['user_id']]
+        
         with get_db() as conn:
-            values.append(session['user_id'])
-            conn.execute(f'''
+            cursor = conn.cursor()
+            
+            cursor.execute(f'''
                 UPDATE users 
-                SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP 
+                SET {set_clause}, updated_at = CURRENT_TIMESTAMP 
                 WHERE id = ?
             ''', values)
             
-            return jsonify({
-                'message': 'Profil mis à jour avec succès',
-                'success': True
-            })
+            conn.commit()
+            
+            return jsonify({'success': True, 'message': 'Profil mis à jour'})
             
     except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
 
 # Routes des demandes/offres
 @app.route('/requests', methods=['GET'])
 def get_requests():
-    """Obtenir les demandes/offres"""
     try:
-        page = int(request.args.get('page', 1))
-        limit = min(int(request.args.get('limit', 20)), 50)  # Max 50
-        offset = (page - 1) * limit
+        # Paramètres de recherche
+        category = request.args.get('category', '')
+        postal_code = request.args.get('postal_code', '')
+        request_type = request.args.get('type', '')  # 'request' ou 'offer'
+        limit = int(request.args.get('limit', 50))
+        
+        query = '''
+            SELECT r.*, u.full_name, u.username, u.rating 
+            FROM requests r 
+            JOIN users u ON r.user_id = u.id 
+            WHERE r.status = 'active'
+        '''
+        params = []
+        
+        if category:
+            query += ' AND r.category = ?'
+            params.append(category)
+        
+        if postal_code:
+            query += ' AND r.postal_code = ?'
+            params.append(postal_code)
+        
+        if request_type:
+            query += ' AND r.type = ?'
+            params.append(request_type)
+        
+        query += ' ORDER BY r.created_at DESC LIMIT ?'
+        params.append(limit)
         
         with get_db() as conn:
-            # Compter le total
-            total = conn.execute(
-                'SELECT COUNT(*) as count FROM requests WHERE status = "active"'
-            ).fetchone()['count']
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
             
-            # Récupérer les demandes
-            requests = conn.execute('''
-                SELECT r.*, u.username, u.full_name, u.rating, u.rating_count
-                FROM requests r
-                JOIN users u ON r.user_id = u.id
-                WHERE r.status = 'active'
-                ORDER BY r.created_at DESC
-                LIMIT ? OFFSET ?
-            ''', (limit, offset)).fetchall()
+            cursor.execute(query, params)
+            requests = cursor.fetchall()
             
-            return jsonify({
-                'requests': [dict(req) for req in requests],
-                'pagination': {
-                    'page': page,
-                    'limit': limit,
-                    'total': total,
-                    'pages': (total + limit - 1) // limit
-                },
-                'success': True
-            })
+            return jsonify({'requests': requests})
             
     except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
 
 @app.route('/requests', methods=['POST'])
-@login_required
+@require_auth
 def create_request():
-    """Créer une nouvelle demande/offre"""
     try:
-        data = request.get_json() if request.is_json else request.form.to_dict()
+        data = request.get_json()
         
-        # Validation des données
-        required_fields = ['title', 'description', 'category', 'type']
-        missing_fields = [field for field in required_fields if not data.get(field)]
+        required_fields = ['type', 'title', 'description', 'category']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Champs requis manquants'}), 400
         
-        if missing_fields:
-            return jsonify({
-                'error': f'Champs manquants: {", ".join(missing_fields)}'
-            }), 400
-        
-        # Validation du type
         if data['type'] not in ['request', 'offer']:
-            return jsonify({'error': 'Type invalide (request ou offer)'}), 400
+            return jsonify({'error': 'Type invalide'}), 400
         
         with get_db() as conn:
-            cursor = conn.execute('''
-                INSERT INTO requests (
-                    user_id, title, description, category, type, 
-                    time_required, price, exchange_type, location, deadline
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO requests 
+                (user_id, type, title, description, category, duration, location, 
+                 postal_code, credits, availability)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 session['user_id'],
+                data['type'],
                 data['title'],
                 data['description'],
                 data['category'],
-                data['type'],
-                int(data.get('time_required', 60)),
-                float(data.get('price', 0)),
-                data.get('exchange_type', 'time'),
+                data.get('duration', ''),
                 data.get('location', ''),
-                data.get('deadline')
+                data.get('postal_code', ''),
+                data.get('credits', 0),
+                data.get('availability', '')
             ))
             
             request_id = cursor.lastrowid
+            conn.commit()
             
             return jsonify({
+                'success': True,
                 'message': 'Demande créée avec succès',
-                'request_id': request_id,
-                'success': True
+                'request_id': request_id
             }), 201
             
     except Exception as e:
-        return jsonify({
-            'error': f'Erreur serveur: {str(e)}',
-            'success': False
-        }), 500
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
 
-# Routes de test
-@app.route('/test', methods=['GET', 'POST'])
-def test():
-    """Endpoint de test pour valider le déploiement"""
+# Routes des réservations
+@app.route('/reservations', methods=['POST'])
+@require_auth
+def create_reservation():
+    try:
+        data = request.get_json()
+        request_id = data.get('request_id')
+        message = data.get('message', '')
+        scheduled_date = data.get('scheduled_date', '')
+        
+        if not request_id:
+            return jsonify({'error': 'ID de demande requis'}), 400
+        
+        with get_db() as conn:
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
+            
+            # Vérifier que la demande existe et est active
+            cursor.execute('SELECT * FROM requests WHERE id = ? AND status = "active"', (request_id,))
+            req = cursor.fetchone()
+            
+            if not req:
+                return jsonify({'error': 'Demande non trouvée ou inactive'}), 404
+            
+            # Empêcher l'auto-réservation
+            if req['user_id'] == session['user_id']:
+                return jsonify({'error': 'Vous ne pouvez pas réserver votre propre demande'}), 400
+            
+            # Déterminer qui est le demandeur et qui est le fournisseur
+            if req['type'] == 'request':
+                requester_id = req['user_id']
+                provider_id = session['user_id']
+            else:  # offer
+                requester_id = session['user_id']
+                provider_id = req['user_id']
+            
+            cursor.execute('''
+                INSERT INTO reservations 
+                (request_id, requester_id, provider_id, message, scheduled_date)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (request_id, requester_id, provider_id, message, scheduled_date))
+            
+            reservation_id = cursor.lastrowid
+            conn.commit()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Réservation créée',
+                'reservation_id': reservation_id
+            }), 201
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+@app.route('/reservations', methods=['GET'])
+@require_auth
+def get_reservations():
+    try:
+        with get_db() as conn:
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT res.*, req.title, req.description, req.type,
+                       u_req.full_name as requester_name,
+                       u_prov.full_name as provider_name
+                FROM reservations res
+                JOIN requests req ON res.request_id = req.id
+                JOIN users u_req ON res.requester_id = u_req.id
+                JOIN users u_prov ON res.provider_id = u_prov.id
+                WHERE res.requester_id = ? OR res.provider_id = ?
+                ORDER BY res.created_at DESC
+            ''', (session['user_id'], session['user_id']))
+            
+            reservations = cursor.fetchall()
+            
+            return jsonify({'reservations': reservations})
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+@app.route('/reservations/<int:reservation_id>/status', methods=['PUT'])
+@require_auth
+def update_reservation_status():
+    try:
+        data = request.get_json()
+        new_status = data.get('status')
+        
+        if new_status not in ['accepted', 'declined', 'completed', 'cancelled']:
+            return jsonify({'error': 'Statut invalide'}), 400
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Vérifier que l'utilisateur peut modifier cette réservation
+            cursor.execute('''
+                SELECT * FROM reservations 
+                WHERE id = ? AND (requester_id = ? OR provider_id = ?)
+            ''', (reservation_id, session['user_id'], session['user_id']))
+            
+            reservation = cursor.fetchone()
+            if not reservation:
+                return jsonify({'error': 'Réservation non trouvée'}), 404
+            
+            cursor.execute('''
+                UPDATE reservations 
+                SET status = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (new_status, reservation_id))
+            
+            conn.commit()
+            
+            return jsonify({'success': True, 'message': 'Statut mis à jour'})
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+# Routes des messages
+@app.route('/messages', methods=['GET'])
+@require_auth
+def get_messages():
+    try:
+        conversation_with = request.args.get('with')  # ID de l'autre utilisateur
+        
+        if conversation_with:
+            # Messages d'une conversation spécifique
+            query = '''
+                SELECT m.*, u.full_name as sender_name
+                FROM messages m
+                JOIN users u ON m.sender_id = u.id
+                WHERE (m.sender_id = ? AND m.receiver_id = ?) 
+                   OR (m.sender_id = ? AND m.receiver_id = ?)
+                ORDER BY m.created_at ASC
+            '''
+            params = [session['user_id'], conversation_with, conversation_with, session['user_id']]
+        else:
+            # Tous les messages reçus
+            query = '''
+                SELECT m.*, u.full_name as sender_name
+                FROM messages m
+                JOIN users u ON m.sender_id = u.id
+                WHERE m.receiver_id = ?
+                ORDER BY m.created_at DESC
+            '''
+            params = [session['user_id']]
+        
+        with get_db() as conn:
+            conn.row_factory = dict_factory
+            cursor = conn.cursor()
+            
+            cursor.execute(query, params)
+            messages = cursor.fetchall()
+            
+            return jsonify({'messages': messages})
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+@app.route('/messages', methods=['POST'])
+@require_auth
+def send_message():
+    try:
+        data = request.get_json()
+        receiver_id = data.get('receiver_id')
+        content = data.get('content', '').strip()
+        request_id = data.get('request_id')
+        reservation_id = data.get('reservation_id')
+        
+        if not receiver_id or not content:
+            return jsonify({'error': 'Destinataire et contenu requis'}), 400
+        
+        if receiver_id == session['user_id']:
+            return jsonify({'error': 'Vous ne pouvez pas vous envoyer un message'}), 400
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO messages 
+                (sender_id, receiver_id, content, request_id, reservation_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session['user_id'], receiver_id, content, request_id, reservation_id))
+            
+            message_id = cursor.lastrowid
+            conn.commit()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Message envoyé',
+                'message_id': message_id
+            }), 201
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+@app.route('/messages/<int:message_id>/read', methods=['PUT'])
+@require_auth
+def mark_message_read():
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE messages 
+                SET is_read = TRUE 
+                WHERE id = ? AND receiver_id = ?
+            ''', (message_id, session['user_id']))
+            
+            conn.commit()
+            
+            return jsonify({'success': True})
+            
+    except Exception as e:
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500
+
+# Route de santé
+@app.route('/health', methods=['GET'])
+def health():
     return jsonify({
-        'message': 'Test API réussi',
-        'method': request.method,
-        'timestamp': datetime.utcnow().isoformat(),
-        'deployment': 'Railway/Render OK',
-        'database': 'SQLite connecté',
-        'session_support': 'Actif',
-        'cors': 'Configuré'
+        'status': 'healthy',
+        'version': '2.1.0',
+        'database': 'connected',
+        'timestamp': datetime.now().isoformat(),
+        'features': ['auth', 'requests', 'reservations', 'messages', 'geolocation']
     })
 
-# Gestion des erreurs
-@app.errorhandler(404)
-def not_found(error):
+# Route racine
+@app.route('/', methods=['GET'])
+def root():
     return jsonify({
-        'error': 'Endpoint non trouvé',
-        'message': 'Vérifiez l\'URL et la méthode HTTP',
-        'available_endpoints': [
-            '/', '/health', '/test',
-            '/auth/register', '/auth/login', '/auth/logout',
-            '/users/profile', '/requests'
-        ]
-    }), 404
+        'name': 'TimeLocal API Enhanced',
+        'version': '2.1.0',
+        'description': 'API complète pour l\'échange de temps et services',
+        'endpoints': {
+            'auth': ['/auth/login', '/auth/register', '/auth/logout'],
+            'users': ['/users/profile'],
+            'requests': ['/requests'],
+            'reservations': ['/reservations'],
+            'messages': ['/messages'],
+            'health': ['/health']
+        }
+    })
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'error': 'Erreur interne du serveur',
-        'message': 'Contactez l\'administrateur si le problème persiste'
-    }), 500
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        'error': 'Méthode HTTP non autorisée',
-        'message': 'Vérifiez la méthode HTTP utilisée (GET, POST, PUT, DELETE)'
-    }), 405
-
-# Configuration des sessions
-app.permanent_session_lifetime = timedelta(days=7)
-
-# Initialisation de la base de données
-with app.app_context():
-    init_db()
-    print("✅ Base de données initialisée")
-
-# Point d'entrée pour les serveurs de production
+# Initialisation et démarrage
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = app.config.get('DEBUG', False)
-    
-    print(f"🚀 Démarrage TimeLocal API sur le port {port}")
-    print(f"🔧 Mode debug: {debug}")
-    print(f"🔑 Secret key configurée: {'✅' if app.config['SECRET_KEY'] else '❌'}")
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
-
-# Export pour Gunicorn (Railway/Render)
-application = app
+    init_db()
+    app.run(
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 5000)),
+        debug=app.config['DEBUG']
+    )
